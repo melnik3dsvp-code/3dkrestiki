@@ -1,107 +1,166 @@
-// Слой данных. Сейчас хранится в localStorage (демо), позже заменяется запросами к серверу (Supabase).
+// Слой данных на Supabase. Интерфейс для app.js и admin.js: чтение из кэша (Store.get()),
+// изменения выполняются на сервере через функции базы (supabase/schema.sql), после чего кэш обновляется.
 (function () {
   'use strict';
-  const KEY = '3dk_state_v1', SKEY = '3dk_session', PKEY = '3dk_photos';
+  const cfg = window.APP_CONFIG;
+  const sb = window.supabase.createClient(cfg.url, cfg.key, { auth: { persistSession: true, autoRefreshToken: true } });
   const listeners = [];
-  let state;
-
-  const uid = p => p + Math.random().toString(36).slice(2, 8);
-  const clone = o => JSON.parse(JSON.stringify(o));
   const rub = n => Math.round(n).toLocaleString('ru-RU') + ' ₽';
 
   const STATUS = {
-    pending: 'Ожидает подтверждения администратора',
-    approved: 'Одобрен',
-    paid: 'Оплачен',
-    shipped: 'Передан в СДЭК',
-    delivered: 'Выдан',
-    rejected: 'Отклонён',
-    cancelled: 'Отменён'
+    pending: 'Ожидает подтверждения администратора', approved: 'Одобрен', paid: 'Оплачен',
+    shipped: 'Передан в СДЭК', delivered: 'Выдан', rejected: 'Отклонён', cancelled: 'Отменён'
+  };
+  const DEFAULT_SETTINGS = {
+    earnPercent: 5, maxPointsPercent: 100, socialReward: 100, welcomeBonus: 0,
+    loyalty: [{ name: 'Старт', from: 0, discount: 0 }, { name: 'Серебро', from: 50000, discount: 3 }, { name: 'Золото', from: 150000, discount: 5 }]
   };
 
-  function defaults() {
-    return {
-      v: 1,
-      settings: {
-        earnPercent: 5, maxPointsPercent: 100, socialReward: 100, welcomeBonus: 0, adminPass: '3dk-admin',
-        loyalty: [
-          { name: 'Старт', from: 0, discount: 0 },
-          { name: 'Серебро', from: 50000, discount: 3 },
-          { name: 'Золото', from: 150000, discount: 5 }
-        ]
-      },
-      products: clone(window.CATALOG),
-      users: {}, orders: [], notifications: [], social: [], pointsLog: [], journal: [], sms: {},
-      promos: [{ code: '3DFAMILY', percent: 5, active: true }],
-      orderSeq: 1000
-    };
-  }
+  const state = { settings: DEFAULT_SETTINGS, products: [], users: {}, orders: [], notifications: [], social: [], pointsLog: [], journal: [], promos: [] };
+  let me = null, session = null, channel = null, poller = null, loadError = '';
+  let readyResolve; const ready = new Promise(r => { readyResolve = r; });
 
-  function load() {
+  const emit = () => listeners.forEach(f => { try { f(); } catch (e) { console.error(e); } });
+  const ts = s => Date.parse(s);
+
+  // ---------- маппинг строк БД в формат интерфейса ----------
+  const mapProfile = r => ({ id: r.id, phone: r.phone, name: r.name, city: r.city, points: r.points, spent: r.spent,
+    fav: r.fav || [], cart: r.cart || [], isAdmin: r.is_admin, blocked: r.blocked, created: ts(r.created_at) });
+  const mapOrder = r => ({ id: r.id, num: r.num, userId: r.user_id, phone: r.phone, name: r.name, items: r.items, pvz: r.pvz, comment: r.comment,
+    subtotal: r.subtotal, levelPct: r.level_pct, promoPct: r.promo_pct, promoCode: r.promo_code, pointsUsed: r.points_used, total: r.total,
+    status: r.status, noPay: r.no_pay, edited: r.edited, paid: r.paid, rejectReason: r.reject_reason, adminComment: r.admin_comment,
+    changes: r.changes || [], history: r.history || [], pointsEarned: r.points_earned, pointsRefunded: r.points_refunded, created: ts(r.created_at) });
+
+  // ---------- загрузка данных ----------
+  let busy = false, again = false;
+  async function refresh() {
+    if (!session) return;
+    if (busy) { again = true; return; }
+    busy = true;
     try {
-      const s = JSON.parse(localStorage.getItem(KEY));
-      if (s && s.v === 1) return s;
-    } catch (e) { /* пусто */ }
-    return defaults();
-  }
-  function save() {
-    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { console.warn('save failed', e); }
+      do {
+        again = false;
+        const T = (t, q) => q || sb.from(t).select('*');
+        const [pr, st, pd, od, nt, pl, so, jr, pm] = await Promise.all([
+          sb.from('profiles').select('*'),
+          sb.from('settings').select('data').eq('id', 1).maybeSingle(),
+          sb.from('products').select('*').order('sort').order('id'),
+          sb.from('orders').select('*').order('created_at', { ascending: false }).limit(500),
+          sb.from('notifications').select('*').order('created_at', { ascending: false }).limit(100),
+          sb.from('points_log').select('*').order('created_at', { ascending: false }).limit(300),
+          sb.from('social').select('*').order('created_at', { ascending: false }).limit(300),
+          sb.from('journal').select('*').order('created_at', { ascending: false }).limit(300),
+          sb.from('promos').select('*').order('code')
+        ]);
+        const bad = [pr, pd, od].find(x => x.error);
+        if (bad) { loadError = bad.error.message; console.error('load error', bad.error); break; }
+        loadError = '';
+        const profiles = (pr.data || []).map(mapProfile);
+        const mine = profiles.find(p => p.id === session.user.id);
+        if (mine) {
+          if (me) { mine.cart = me.cart; mine.fav = me.fav; } // корзину и избранное ведёт клиент
+          me = mine;
+        }
+        state.users = {}; profiles.forEach(p => { state.users[p.phone] = p; });
+        if (st.data) state.settings = Object.assign({}, DEFAULT_SETTINGS, st.data.data);
+        state.products = (pd.data || []).map(r => Object.assign({}, r.data, { id: r.id, sku: r.sku }));
+        state.orders = (od.data || []).map(mapOrder);
+        state.notifications = (nt.data || []).map(r => ({ id: r.id, phone: me ? me.phone : '', title: r.title, text: r.text, orderId: r.order_id, read: r.read, t: ts(r.created_at) }));
+        state.pointsLog = (pl.data || []).map(r => ({ id: r.id, phone: me ? me.phone : '', delta: r.delta, reason: r.reason, t: ts(r.created_at), userId: r.user_id }));
+        state.social = (so.data || []).map(r => ({ id: r.id, userId: r.user_id, phone: r.phone, network: r.network, url: r.url, note: r.note, shot: r.shot, status: r.status, reward: r.reward, t: ts(r.created_at) }));
+        state.journal = (jr.data || []).map(r => ({ id: r.id, text: r.text, t: ts(r.created_at) }));
+        state.promos = pm.data || [];
+      } while (again);
+    } catch (e) { loadError = String(e.message || e); console.error(e); }
+    busy = false;
     emit();
   }
-  function emit() { listeners.forEach(f => { try { f(); } catch (e) { console.error(e); } }); }
+  let sched;
+  const scheduleRefresh = () => { clearTimeout(sched); sched = setTimeout(refresh, 300); };
 
-  state = load();
-  window.addEventListener('storage', e => {
-    if (e.key === KEY) { state = load(); emit(); }
+  function startRealtime() {
+    if (channel) return;
+    channel = sb.channel('db-changes').on('postgres_changes', { event: '*', schema: 'public' }, scheduleRefresh).subscribe();
+    poller = setInterval(() => { if (!document.hidden) refresh(); }, 30000);
+  }
+  function resetState() {
+    if (channel) { sb.removeChannel(channel); channel = null; }
+    clearInterval(poller);
+    me = null; session = null;
+    Object.assign(state, { users: {}, orders: [], notifications: [], social: [], pointsLog: [], journal: [], promos: [] });
+  }
+
+  sb.auth.onAuthStateChange((ev, s) => {
+    session = s;
+    setTimeout(async () => {
+      if (s) { await refresh(); startRealtime(); } else { resetState(); emit(); }
+      readyResolve();
+    }, 0);
   });
 
-  // ---------- сессия клиента ----------
+  // ---------- вход ----------
   const normPhone = p => {
     const d = String(p || '').replace(/\D/g, '');
     if (d.length === 11 && (d[0] === '7' || d[0] === '8')) return '+7' + d.slice(1);
     if (d.length === 10) return '+7' + d;
     return null;
   };
-  const currentPhone = () => { try { return localStorage.getItem(SKEY); } catch (e) { return null; } };
-  function currentUser() { const ph = currentPhone(); return ph ? state.users[ph] || null : null; }
-
-  function requestCode(phone) {
+  const emailOf = ph => ph.replace(/\D/g, '') + '@phone.3dkrestiki.app';
+  const authMsg = e => {
+    const m = String(e.message || e);
+    if (/already registered|already been registered/i.test(m)) return 'Этот номер уже зарегистрирован. Нажмите «Войти»';
+    if (/invalid login/i.test(m)) return 'Неверный номер или пароль';
+    if (/password/i.test(m) && /6/.test(m)) return 'Пароль не короче 6 символов';
+    if (/rate limit|too many/i.test(m)) return 'Слишком много попыток. Подождите минуту';
+    return m;
+  };
+  async function register(phone, password, name) {
     const ph = normPhone(phone);
     if (!ph) return { error: 'Введите номер в формате +7 900 000-00-00' };
-    const code = String(Math.floor(1000 + Math.random() * 9000));
-    state.sms[ph] = { code, t: Date.now() };
-    save();
-    return { phone: ph, code }; // в боевой версии код уходит SMS-провайдером и не возвращается
-  }
-  function verifyCode(phone, code) {
-    const rec = state.sms[phone];
-    if (!rec || rec.code !== String(code).trim()) return { error: 'Неверный код' };
-    delete state.sms[phone];
-    if (!state.users[phone]) {
-      state.users[phone] = { phone, name: '', city: '', points: 0, spent: 0, fav: [], cart: [], created: Date.now(), blocked: false };
-      if (state.settings.welcomeBonus > 0) addPoints(phone, state.settings.welcomeBonus, 'Приветственный бонус');
-    }
-    localStorage.setItem(SKEY, phone);
-    save();
+    if (!password || password.length < 6) return { error: 'Пароль не короче 6 символов' };
+    const { data, error } = await sb.auth.signUp({ email: emailOf(ph), password, options: { data: { phone: ph, name: (name || '').trim() } } });
+    if (error) return { error: authMsg(error) };
+    if (!data.session) return { error: 'Регистрация требует подтверждения почты: в Supabase отключите «Confirm email» (Authentication → Sign In / Providers → User Signups)' };
+    session = data.session;
+    await refresh();
     return { ok: true };
   }
-  function logout() { localStorage.removeItem(SKEY); emit(); }
-  function updateProfile(patch) {
-    const u = currentUser(); if (!u) return;
-    Object.assign(u, patch); save();
+  async function login(phone, password) {
+    const ph = normPhone(phone);
+    if (!ph) return { error: 'Введите номер в формате +7 900 000-00-00' };
+    const { data, error } = await sb.auth.signInWithPassword({ email: emailOf(ph), password: password || '' });
+    if (error) return { error: authMsg(error) };
+    session = data.session; // сессия нужна до первой загрузки данных
+    await refresh();
+    return { ok: true };
   }
+  async function adminLogin(email, password) {
+    const { data, error } = await sb.auth.signInWithPassword({ email: String(email || '').trim(), password: password || '' });
+    if (error) return { error: authMsg(error) };
+    session = data.session; // сессия нужна до первой загрузки данных
+    await refresh();
+    if (!me || !me.isAdmin) {
+      const why = loadError ? 'Не удалось загрузить данные: ' + loadError : 'У этого аккаунта нет прав администратора';
+      await sb.auth.signOut();
+      return { error: why };
+    }
+    return { ok: true };
+  }
+  const logout = async () => { await sb.auth.signOut(); };
 
-  // ---------- уровни и расчёт ----------
-  function levelOf(user) {
-    const lv = state.settings.loyalty.slice().sort((a, b) => a.from - b.from);
-    let cur = lv[0], next = null;
-    lv.forEach(l => { if ((user.spent || 0) >= l.from) cur = l; });
-    next = lv.find(l => l.from > cur.from) || null;
-    return { cur, next };
-  }
+  // ---------- вспомогательные ----------
+  const currentUser = () => me;
+  const currentPhone = () => (me ? me.phone : null);
   const product = id => state.products.find(p => p.id === id);
   const variantOf = (p, vid) => p && p.variants.find(v => v.id === vid);
+  const order = id => state.orders.find(o => o.id === id);
 
+  function levelOf(user) {
+    const lv = state.settings.loyalty.slice().sort((a, b) => a.from - b.from);
+    let cur = lv[0];
+    lv.forEach(l => { if ((user.spent || 0) >= l.from) cur = l; });
+    return { cur, next: lv.find(l => l.from > cur.from) || null };
+  }
   function cartLines(user) {
     return (user.cart || []).map(c => {
       const p = product(c.pid), v = variantOf(p, c.vid);
@@ -109,16 +168,14 @@
       return { pid: p.id, vid: v.id, name: p.name, label: v.label, price: v.price, qty: c.qty, available: p.inStock && v.inStock };
     }).filter(Boolean);
   }
-
+  // Расчёт для показа на экране. Итог по заказу всегда пересчитывает сервер.
   function calc(user, opts) {
     opts = opts || {};
     const lines = opts.lines || cartLines(user);
     const subtotal = lines.reduce((s, l) => s + l.price * l.qty, 0);
     const levelPct = opts.levelPct != null ? opts.levelPct : levelOf(user).cur.discount;
-    const promo = opts.promoPct != null ? { percent: opts.promoPct } : (opts.promo ? state.promos.find(p => p.active && p.code === String(opts.promo).toUpperCase()) : null);
-    const promoPct = promo ? promo.percent : 0;
-    const levelDisc = Math.round(subtotal * levelPct / 100);
-    const promoDisc = Math.round(subtotal * promoPct / 100);
+    const promoPct = opts.promoPct || 0;
+    const levelDisc = Math.round(subtotal * levelPct / 100), promoDisc = Math.round(subtotal * promoPct / 100);
     const afterDisc = Math.max(0, subtotal - levelDisc - promoDisc);
     const maxByRule = Math.floor(afterDisc * state.settings.maxPointsPercent / 100);
     const pointsMax = Math.max(0, Math.min(user.points + (opts.pointsAlready || 0), maxByRule));
@@ -126,92 +183,71 @@
     return { lines, subtotal, levelPct, levelDisc, promoPct, promoDisc, afterDisc, pointsMax, points, total: afterDisc - points };
   }
 
-  // ---------- корзина и избранное ----------
+  async function rpc(fn, args) {
+    const { data, error } = await sb.rpc(fn, args || {});
+    if (error) return { error: error.message };
+    await refresh();
+    return { data };
+  }
+  async function checkPromo(code) {
+    const { data, error } = await sb.rpc('check_promo', { p_code: code || '' });
+    return error ? 0 : (data || 0);
+  }
+
+  // ---------- корзина и профиль (сохраняются в профиле клиента) ----------
+  let saveTimer;
+  function persistProfile() {
+    emit();
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => { if (me) sb.from('profiles').update({ cart: me.cart, fav: me.fav }).eq('id', me.id).then(() => {}); }, 400);
+  }
   function addToCart(pid, vid, qty) {
-    const u = currentUser(); if (!u) return;
-    const it = u.cart.find(c => c.pid === pid && c.vid === vid);
-    if (it) it.qty += qty || 1; else u.cart.push({ pid, vid, qty: qty || 1 });
-    save();
+    if (!me) return;
+    const it = me.cart.find(c => c.pid === pid && c.vid === vid);
+    if (it) it.qty += qty || 1; else me.cart.push({ pid, vid, qty: qty || 1 });
+    persistProfile();
   }
   function setQty(pid, vid, qty) {
-    const u = currentUser(); if (!u) return;
-    const i = u.cart.findIndex(c => c.pid === pid && c.vid === vid);
+    if (!me) return;
+    const i = me.cart.findIndex(c => c.pid === pid && c.vid === vid);
     if (i < 0) return;
-    if (qty <= 0) u.cart.splice(i, 1); else u.cart[i].qty = Math.min(qty, 9999);
-    save();
+    if (qty <= 0) me.cart.splice(i, 1); else me.cart[i].qty = Math.min(qty, 9999);
+    persistProfile();
   }
-  function clearCart() { const u = currentUser(); if (u) { u.cart = []; save(); } }
   function toggleFav(pid) {
-    const u = currentUser(); if (!u) return;
-    const i = u.fav.indexOf(pid);
-    if (i >= 0) u.fav.splice(i, 1); else u.fav.push(pid);
-    save();
+    if (!me) return;
+    const i = me.fav.indexOf(pid);
+    if (i >= 0) me.fav.splice(i, 1); else me.fav.push(pid);
+    persistProfile();
+  }
+  async function updateProfile(patch) {
+    if (!me) return;
+    Object.assign(me, patch);
+    await sb.from('profiles').update(patch).eq('id', me.id);
+    emit();
   }
 
-  // ---------- уведомления, баллы, журнал ----------
-  function notify(phone, title, text, orderId) {
-    state.notifications.unshift({ id: uid('n'), phone, title, text, orderId: orderId || null, t: Date.now(), read: false });
-    if (state.notifications.length > 500) state.notifications.length = 500;
+  // ---------- клиент: заказы, уведомления, соцсети ----------
+  const myNotifs = () => state.notifications;
+  function markRead() {
+    if (!state.notifications.some(n => !n.read)) return;
+    state.notifications.forEach(n => { n.read = true; });
+    emit();
+    sb.rpc('mark_notifs_read').then(() => {});
   }
-  function addPoints(phone, delta, reason) {
-    const u = state.users[phone]; if (!u) return;
-    u.points = Math.max(0, u.points + delta);
-    state.pointsLog.unshift({ id: uid('p'), phone, delta, reason, t: Date.now() });
+  async function createOrder(opts) {
+    if (!me) return { error: 'Войдите в приложение' };
+    const items = me.cart.map(c => ({ pid: c.pid, vid: c.vid, qty: c.qty }));
+    const r = await rpc('create_order', { p_items: items, p_pvz: opts.pvz || null, p_name: opts.name || '', p_comment: opts.comment || '', p_points: opts.points || 0, p_promo: opts.promo || '' });
+    if (r.error) return r;
+    me.cart = [];
+    emit();
+    return { order: mapOrder(r.data) };
   }
-  function journal(text) { state.journal.unshift({ id: uid('j'), t: Date.now(), text }); if (state.journal.length > 500) state.journal.length = 500; }
-  function myNotifs() { const ph = currentPhone(); return state.notifications.filter(n => n.phone === ph); }
-  function markRead() { const ph = currentPhone(); state.notifications.forEach(n => { if (n.phone === ph) n.read = true; }); save(); }
-
-  // ---------- заказы ----------
-  function logOrder(o, text) { o.history.push({ t: Date.now(), text }); }
-
-  function createOrder(opts) {
-    const u = currentUser(); if (!u) return { error: 'Войдите в приложение' };
-    const c = calc(u, { points: opts.points, promo: opts.promo });
-    if (!c.lines.length) return { error: 'Корзина пуста' };
-    if (c.lines.some(l => !l.available)) return { error: 'В корзине есть товары, которых нет в наличии' };
-    if (!opts.pvz) return { error: 'Выберите пункт выдачи СДЭК' };
-    if (!opts.name || !opts.name.trim()) return { error: 'Укажите имя получателя' };
-    const o = {
-      id: uid('o'), num: ++state.orderSeq, phone: u.phone, name: opts.name.trim(),
-      items: c.lines.map(l => ({ pid: l.pid, vid: l.vid, name: l.name, label: l.label, price: l.price, qty: l.qty })),
-      pvz: opts.pvz, comment: (opts.comment || '').trim(),
-      subtotal: c.subtotal, levelPct: c.levelPct, promoPct: c.promoPct, promoCode: c.promoPct ? String(opts.promo).toUpperCase() : '',
-      pointsUsed: c.points, total: c.total,
-      status: 'pending', noPay: c.total === 0, edited: false, paid: false,
-      rejectReason: '', adminComment: '', changes: [], history: [], created: Date.now()
-    };
-    logOrder(o, 'Заявка отправлена');
-    if (c.points) addPoints(u.phone, -c.points, 'Списание за заказ №' + o.num);
-    u.cart = []; u.name = u.name || o.name; u.city = u.city || o.pvz.city;
-    state.orders.unshift(o);
-    notify(u.phone, 'Заявка №' + o.num + ' отправлена', 'Ожидает подтверждения администратора', o.id);
-    save();
-    return { order: o };
-  }
-
-  function refundPoints(o, why) {
-    if (o.pointsUsed > 0) { addPoints(o.phone, o.pointsUsed, why + ' №' + o.num); o.pointsRefunded = (o.pointsRefunded || 0) + o.pointsUsed; o.pointsUsed = 0; }
-  }
-  const order = id => state.orders.find(o => o.id === id);
-
-  function cancelOrder(id) {
-    const o = order(id); if (!o || o.phone !== currentPhone()) return;
-    if (['shipped', 'delivered', 'rejected', 'cancelled'].includes(o.status)) return;
-    if (o.paid) return { error: 'Оплаченный заказ отменяет администратор' };
-    refundPoints(o, 'Возврат баллов за отменённый заказ');
-    o.status = 'cancelled'; logOrder(o, 'Отменён клиентом');
-    journal('Клиент ' + o.phone + ' отменил заказ №' + o.num);
-    save();
-  }
-  function payOrder(id) { // демо-оплата ЮKassa
-    const o = order(id); if (!o || o.status !== 'approved' || o.noPay || o.paid) return;
-    o.paid = true; o.status = 'paid'; logOrder(o, 'Оплата получена (' + rub(o.total) + ')');
-    notify(o.phone, 'Оплата заказа №' + o.num + ' получена', 'Заказ передан в сборку', o.id);
-    save();
-  }
+  const cancelOrder = id => rpc('cancel_order', { p_id: id });
+  const payOrder = id => rpc('pay_order', { p_id: id });
   function repeatOrder(id) {
-    const o = order(id), u = currentUser(); if (!o || !u) return 0;
+    const o = order(id); if (!o || !me) return 0;
     let n = 0;
     o.items.forEach(it => {
       const p = product(it.pid), v = variantOf(p, it.vid);
@@ -219,128 +255,124 @@
     });
     return n;
   }
+  const submitSocial = (network, url, note, shot) => rpc('submit_social', { p_network: network, p_url: url, p_note: note, p_shot: shot || '' });
 
-  // ---------- действия администратора ----------
-  function approveOrder(id, noPay) {
-    const o = order(id); if (!o || o.status !== 'pending') return;
-    o.noPay = !!noPay || o.total === 0;
-    o.status = 'approved';
-    logOrder(o, o.edited ? 'Одобрен с изменениями' : 'Одобрен администратором');
-    if (o.noPay) logOrder(o, 'Согласован без онлайн-оплаты');
-    notify(o.phone,
-      (o.edited ? 'Заказ №' + o.num + ' одобрен с изменениями' : 'Заказ №' + o.num + ' одобрен'),
-      o.noPay ? 'Оплата не требуется, заказ передан в работу' + (o.adminComment ? '. ' + o.adminComment : '')
-              : 'Оплатите заказ в приложении: ' + rub(o.total) + (o.adminComment ? '. ' + o.adminComment : ''), o.id);
-    journal('Одобрен заказ №' + o.num + (o.noPay ? ' (без оплаты)' : '') + (o.edited ? ' с изменениями' : ''));
-    save();
-  }
-  function rejectOrder(id, reason) {
-    const o = order(id); if (!o || !['pending', 'approved'].includes(o.status) || o.paid) return;
-    o.status = 'rejected'; o.rejectReason = reason || 'Причина не указана';
-    refundPoints(o, 'Возврат баллов за отклонённый заказ');
-    logOrder(o, 'Отклонён: ' + o.rejectReason);
-    notify(o.phone, 'Заказ №' + o.num + ' отклонён', o.rejectReason, o.id);
-    journal('Отклонён заказ №' + o.num + ': ' + o.rejectReason);
-    save();
-  }
-
-  function diffItems(oldO, nw) {
-    const out = [], key = i => i.pid + '|' + i.vid;
-    const om = {}; oldO.items.forEach(i => om[key(i)] = i);
-    const nm = {}; nw.items.forEach(i => nm[key(i)] = i);
-    oldO.items.forEach(i => {
-      const n = nm[key(i)];
-      if (!n) out.push('Убрана позиция: ' + i.name + ' (' + i.label + ')');
-      else {
-        if (n.qty !== i.qty) out.push(i.name + ' (' + i.label + '): ' + i.qty + ' → ' + n.qty + ' шт');
-        if (n.price !== i.price) out.push(i.name + ': цена ' + rub(i.price) + ' → ' + rub(n.price));
-      }
-    });
-    if (nw.pointsUsed !== oldO.pointsUsed) out.push('Списано баллов: ' + oldO.pointsUsed + ' → ' + nw.pointsUsed);
-    if (nw.noPay !== oldO.noPay) out.push(nw.noPay ? 'Без онлайн-оплаты' : 'Требуется онлайн-оплата');
-    return out;
+  // ---------- администратор ----------
+  const approveOrder = (id, noPay) => rpc('admin_approve', { p_id: id, p_no_pay: !!noPay });
+  const rejectOrder = (id, reason) => rpc('admin_reject', { p_id: id, p_reason: reason });
+  const markPaidManually = id => rpc('admin_mark_paid', { p_id: id });
+  const advanceOrder = (id, status) => rpc('admin_advance', { p_id: id, p_status: status });
+  const reviewSocial = (id, ok, reward) => rpc('admin_review_social', { p_id: id, p_ok: !!ok, p_reward: Math.floor(reward || 0) });
+  function adjustPoints(phone, delta, reason) {
+    const u = state.users[phone]; if (!u) return Promise.resolve({ error: 'Клиент не найден' });
+    return rpc('admin_adjust_points', { p_user: u.id, p_delta: delta, p_reason: reason || '' });
   }
 
   // patch: {items:[{pid,vid,qty,price}], pointsUsed, noPay, adminComment}
-  function editOrder(id, patch, approve) {
-    const o = order(id); if (!o || !['pending', 'approved'].includes(o.status) || o.paid) return { error: 'Заказ нельзя изменить' };
+  async function editOrder(id, patch, approve) {
+    const o = order(id); if (!o) return { error: 'Заказ не найден' };
     const u = state.users[o.phone];
-    const before = clone(o);
-    const items = patch.items.filter(i => i.qty > 0).map(i => {
-      const old = o.items.find(x => x.pid === i.pid && x.vid === i.vid);
-      return Object.assign({}, old, { qty: Math.floor(i.qty), price: Number(i.price) });
-    });
+    const items = patch.items.filter(i => i.qty > 0).map(i => Object.assign({}, o.items.find(x => x.pid === i.pid && x.vid === i.vid), { qty: Math.floor(i.qty), price: Number(i.price) }));
     if (!items.length) return { error: 'В заказе должна остаться хотя бы одна позиция. Для отказа используйте «Отклонить»' };
     const c = calc(u, { lines: items, levelPct: o.levelPct, promoPct: o.promoPct, points: patch.pointsUsed, pointsAlready: o.pointsUsed });
-    const delta = c.points - o.pointsUsed;
-    o.items = items; o.subtotal = c.subtotal; o.total = c.total;
-    if (delta !== 0) addPoints(o.phone, -delta, 'Корректировка заказа №' + o.num);
-    o.pointsUsed = c.points;
-    o.noPay = !!patch.noPay || o.total === 0;
-    o.adminComment = patch.adminComment || '';
-    const diff = diffItems(before, o);
-    if (diff.length || (before.adminComment !== o.adminComment)) {
-      o.edited = true;
-      o.changes.push({ t: Date.now(), list: diff, total: o.total, comment: o.adminComment });
-      logOrder(o, 'Администратор изменил заказ');
-      if (!approve) notify(o.phone, 'Заказ №' + o.num + ' изменён', diff.concat(['Сумма: ' + rub(o.total)]).join('; '), o.id);
+    const key = i => i.pid + '|' + i.vid, nm = {};
+    items.forEach(i => { nm[key(i)] = i; });
+    const diff = [];
+    o.items.forEach(i => {
+      const n = nm[key(i)];
+      if (!n) diff.push('Убрана позиция: ' + i.name + ' (' + i.label + ')');
+      else {
+        if (n.qty !== i.qty) diff.push(i.name + ' (' + i.label + '): ' + i.qty + ' → ' + n.qty + ' шт');
+        if (n.price !== i.price) diff.push(i.name + ': цена ' + rub(i.price) + ' → ' + rub(n.price));
+      }
+    });
+    if (c.points !== o.pointsUsed) diff.push('Списано баллов: ' + o.pointsUsed + ' → ' + c.points);
+    const np = !!patch.noPay || c.total === 0;
+    if (np !== o.noPay) diff.push(np ? 'Без онлайн-оплаты' : 'Требуется онлайн-оплата');
+    return rpc('admin_edit_order', {
+      p_id: id, p_items: items.map(i => ({ pid: i.pid, vid: i.vid, qty: i.qty, price: i.price })), p_points: c.points,
+      p_no_pay: np, p_comment: patch.adminComment || '', p_approve: !!approve, p_diff: diff
+    });
+  }
+
+  // каталог
+  const sortIndex = p => state.products.findIndex(x => x.id === p.id);
+  function productRow(p, sort) {
+    const data = Object.assign({}, p); delete data.id; delete data.sku;
+    return { id: p.id, sku: p.sku, data, sort };
+  }
+  async function saveProduct(p) {
+    let s = sortIndex(p); if (s < 0) s = state.products.length;
+    const { error } = await sb.from('products').upsert(productRow(p, s));
+    if (error) return { error: error.message };
+    await refresh(); return { ok: true };
+  }
+  async function importProducts(list, mode) {
+    if (mode === 'replace') {
+      const d = await sb.from('products').delete().neq('id', '');
+      if (d.error) return { error: d.error.message };
     }
-    journal('Изменён заказ №' + o.num + (diff.length ? ': ' + diff.join('; ') : ''));
-    if (approve && o.status === 'pending') { save(); approveOrder(id, o.noPay); return { ok: true }; }
-    if (!approve && o.status === 'approved' && diff.length) { /* уже одобрен: клиент получил уведомление об изменении */ }
-    save();
-    return { ok: true };
+    const base = mode === 'replace' ? 0 : state.products.length;
+    const rows = list.map((p, i) => {
+      const old = state.products.find(x => x.sku === p.sku);
+      if (old && mode !== 'replace') { p.id = old.id; if (old.photo) p.photo = old.photo; }
+      return productRow(p, old && mode !== 'replace' ? sortIndex(old) : base + i);
+    });
+    for (let i = 0; i < rows.length; i += 100) {
+      const { error } = await sb.from('products').upsert(rows.slice(i, i + 100), { onConflict: 'id' });
+      if (error) return { error: error.message };
+    }
+    await sb.rpc('admin_log', { p_text: 'Импорт прайса: ' + list.length + ' товаров (' + (mode === 'replace' ? 'замена' : 'обновление') + ')' });
+    await refresh(); return { ok: true };
   }
-  function markPaidManually(id) {
-    const o = order(id); if (!o || o.status !== 'approved') return;
-    o.paid = true; o.noPay = false; o.status = 'paid'; logOrder(o, 'Оплата отмечена администратором');
-    notify(o.phone, 'Оплата заказа №' + o.num + ' подтверждена', 'Заказ передан в сборку', o.id);
-    journal('Отмечена оплата заказа №' + o.num); save();
+  function setStock(pid, vid, inStock) {
+    const p = product(pid); if (!p) return;
+    if (vid) { const v = variantOf(p, vid); if (v) v.inStock = inStock; } else p.inStock = inStock;
+    return saveProduct(p);
   }
-  function advanceOrder(id, status) {
-    const o = order(id); if (!o) return;
-    if (status === 'shipped' && (o.status === 'paid' || (o.status === 'approved' && o.noPay))) {
-      o.status = 'shipped'; logOrder(o, 'Передан в СДЭК');
-      notify(o.phone, 'Заказ №' + o.num + ' передан в СДЭК', 'Пункт выдачи: ' + o.pvz.address, o.id);
-    } else if (status === 'delivered' && o.status === 'shipped') {
-      o.status = 'delivered'; logOrder(o, 'Выдан');
-      const u = state.users[o.phone];
-      const base = o.total;
-      const earn = Math.floor(base * state.settings.earnPercent / 100);
-      if (u) { u.spent = (u.spent || 0) + o.subtotal; }
-      if (earn > 0) { addPoints(o.phone, earn, 'Баллы за заказ №' + o.num); o.pointsEarned = earn; }
-      notify(o.phone, 'Заказ №' + o.num + ' получен', earn > 0 ? 'Начислено баллов: ' + earn : 'Спасибо за заказ!', o.id);
-    } else return;
-    journal('Заказ №' + o.num + ' → ' + STATUS[o.status]); save();
+  function setPrice(pid, vid, price) {
+    const v = variantOf(product(pid), vid); if (!v) return;
+    v.price = Math.max(0, Number(price) || 0);
+    return saveProduct(product(pid));
+  }
+  async function deleteProduct(pid) { await sb.from('products').delete().eq('id', pid); await refresh(); }
+
+  const photoKey = sku => String(sku).replace(/[^A-Za-z0-9._-]/g, '_') + '.jpg';
+  function photoOf(sku) {
+    const p = state.products.find(x => x.sku === sku);
+    return p && p.photo ? cfg.url + '/storage/v1/object/public/photos/' + encodeURIComponent(photoKey(sku)) + '?v=' + p.photo : '';
+  }
+  async function setPhoto(sku, dataUrl) {
+    const p = state.products.find(x => x.sku === sku); if (!p) return false;
+    const blob = await (await fetch(dataUrl)).blob();
+    const up = await sb.storage.from('photos').upload(photoKey(sku), blob, { upsert: true, contentType: 'image/jpeg' });
+    if (up.error) { console.error(up.error); return false; }
+    p.photo = Date.now();
+    const r = await saveProduct(p);
+    return !r.error;
   }
 
-  // ---------- соцсети ----------
-  function submitSocial(network, url, note, shot) {
-    const u = currentUser(); if (!u) return;
-    state.social.unshift({ id: uid('s'), phone: u.phone, network, url, note, shot: shot || '', status: 'pending', t: Date.now(), reward: 0 });
-    save();
+  // настройки и промокоды
+  async function updateSettings(patch) {
+    const data = Object.assign({}, state.settings, patch);
+    const { error } = await sb.from('settings').upsert({ id: 1, data });
+    if (error) return { error: error.message };
+    await sb.rpc('admin_log', { p_text: 'Изменены настройки' });
+    await refresh(); return { ok: true };
   }
-  function reviewSocial(id, ok, reward) {
-    const s = state.social.find(x => x.id === id); if (!s || s.status !== 'pending') return;
-    s.status = ok ? 'approved' : 'rejected';
-    if (ok) {
-      s.reward = Math.max(0, Math.floor(reward));
-      addPoints(s.phone, s.reward, 'Публикация в ' + s.network);
-      notify(s.phone, 'Публикация одобрена', 'Начислено баллов: ' + s.reward);
-    } else notify(s.phone, 'Публикация не принята', 'Проверьте, что ссылка открыта, и отправьте ещё раз');
-    journal('Публикация ' + s.phone + (ok ? ' одобрена (+' + s.reward + ')' : ' отклонена'));
-    save();
+  async function savePromo(code, percent, active) {
+    const { error } = await sb.from('promos').upsert({ code: String(code).trim().toUpperCase(), percent, active });
+    if (error) return { error: error.message };
+    await refresh(); return { ok: true };
   }
 
-  // ---------- каталог (админ) ----------
   function parseCsv(text) {
     const lines = text.replace(/^﻿/, '').split(/\r?\n/).filter(l => l.trim());
     if (lines.length < 2) return { error: 'Файл пуст' };
     const sep = lines[0].includes(';') ? ';' : ',';
     const head = lines[0].split(sep).map(h => h.trim().toLowerCase());
     const col = n => head.indexOf(n);
-    const need = ['sku', 'name', 'price'];
-    for (const n of need) if (col(n) < 0) return { error: 'Нет колонки «' + n + '». Нужны: sku, name, brand, category, variant, price, stock' };
+    for (const n of ['sku', 'name', 'price']) if (col(n) < 0) return { error: 'Нет колонки «' + n + '». Нужны: sku, name, brand, category, variant, price, stock' };
     const map = new Map();
     for (let i = 1; i < lines.length; i++) {
       const c = lines[i].split(sep).map(x => x.trim());
@@ -352,11 +384,9 @@
       let p = map.get(sku);
       if (!p) {
         const cat = col('category') >= 0 ? c[col('category')] : '';
-        p = {
-          id: sku.toLowerCase().replace(/[^a-z0-9а-я]+/gi, '-'), sku,
-          name: c[col('name')], brand: col('brand') >= 0 ? c[col('brand')] : '', category: cat || 'Прочее',
-          desc: col('desc') >= 0 ? c[col('desc')] : '', variants: [], inStock: true, merch: /мерч/i.test(cat)
-        };
+        p = { id: sku.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || ('p' + i), sku, name: c[col('name')],
+          brand: col('brand') >= 0 ? c[col('brand')] : '', category: cat || 'Прочее', desc: col('desc') >= 0 ? c[col('desc')] : '',
+          variants: [], inStock: true, merch: /мерч/i.test(cat) };
         map.set(sku, p);
       }
       const label = col('variant') >= 0 && c[col('variant')] ? c[col('variant')] : 'шт';
@@ -364,52 +394,15 @@
     }
     return { products: [...map.values()] };
   }
-  function importProducts(products, mode) {
-    if (mode === 'replace') state.products = products;
-    else products.forEach(np => {
-      const i = state.products.findIndex(p => p.sku === np.sku);
-      if (i >= 0) { np.photo = state.products[i].photo; state.products[i] = np; } else state.products.push(np);
-    });
-    journal('Импорт прайса: ' + products.length + ' товаров (' + (mode === 'replace' ? 'замена' : 'обновление') + ')');
-    save();
-  }
-  function upsertProduct(p) {
-    const i = state.products.findIndex(x => x.id === p.id);
-    if (i >= 0) state.products[i] = p; else state.products.push(p);
-    save();
-  }
-  function setStock(pid, vid, inStock) {
-    const p = product(pid); if (!p) return;
-    if (vid) { const v = variantOf(p, vid); if (v) v.inStock = inStock; } else p.inStock = inStock;
-    save();
-  }
-  function deleteProduct(pid) { state.products = state.products.filter(p => p.id !== pid); save(); }
-
-  // фото хранятся отдельно: ключ — артикул
-  function photos() { try { return JSON.parse(localStorage.getItem(PKEY)) || {}; } catch (e) { return {}; } }
-  function setPhoto(sku, dataUrl) {
-    const ph = photos(); ph[sku] = dataUrl;
-    try { localStorage.setItem(PKEY, JSON.stringify(ph)); emit(); return true; } catch (e) { return false; }
-  }
-  const photoOf = sku => photos()[sku] || '';
-
-  function adjustPoints(phone, delta, reason) {
-    addPoints(phone, delta, reason || 'Корректировка администратором');
-    notify(phone, delta > 0 ? 'Начислены баллы: ' + delta : 'Списаны баллы: ' + (-delta), reason || '');
-    journal('Баллы ' + phone + ': ' + (delta > 0 ? '+' : '') + delta + (reason ? ' (' + reason + ')' : ''));
-    save();
-  }
-  function updateSettings(patch) { Object.assign(state.settings, patch); journal('Изменены настройки'); save(); }
-  function resetAll() { localStorage.removeItem(KEY); localStorage.removeItem(PKEY); localStorage.removeItem(SKEY); state = load(); emit(); }
 
   window.Store = {
-    get: () => state, subscribe: f => listeners.push(f), STATUS, rub, uid,
-    normPhone, currentUser, currentPhone, requestCode, verifyCode, logout, updateProfile,
-    levelOf, product, variantOf, cartLines, calc, addToCart, setQty, clearCart, toggleFav,
-    myNotifs, markRead, createOrder, cancelOrder, payOrder, repeatOrder, order,
-    approveOrder, rejectOrder, editOrder, markPaidManually, advanceOrder,
-    submitSocial, reviewSocial, parseCsv, importProducts, upsertProduct, setStock, deleteProduct,
-    photoOf, setPhoto, adjustPoints, updateSettings, resetAll, save,
+    get: () => state, subscribe: f => listeners.push(f), ready, STATUS, rub, loadError: () => loadError,
+    normPhone, currentUser, currentPhone, register, login, adminLogin, logout, updateProfile,
+    levelOf, product, variantOf, cartLines, calc, checkPromo, addToCart, setQty, toggleFav,
+    myNotifs, markRead, createOrder, cancelOrder, payOrder, repeatOrder, order, submitSocial,
+    approveOrder, rejectOrder, editOrder, markPaidManually, advanceOrder, reviewSocial, adjustPoints,
+    parseCsv, importProducts, saveProduct, setStock, setPrice, deleteProduct, photoOf, setPhoto,
+    updateSettings, savePromo, refresh,
     statusLabel(o) {
       if (o.status === 'approved') return (o.edited ? 'Одобрен с изменениями' : 'Одобрен') + (o.noPay ? ' · без онлайн-оплаты' : ' · ожидает оплаты');
       return STATUS[o.status];

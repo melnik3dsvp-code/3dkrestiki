@@ -5,9 +5,9 @@
 
   // ---------- локальное состояние интерфейса ----------
   const ui = {
-    q: '', brand: '', cat: '', loginPhone: '', loginStep: 1, loginCode: '', loginErr: '',
-    cartPromo: '', cartPoints: 0, form: { name: '', city: '', pvz: null, comment: '' },
-    modal: null, merchTab: 'shop', lastSeenNotif: null
+    q: '', brand: '', cat: '', loginPhone: '', loginName: '', loginMode: 'login', loginErr: '', busy: false, ready: false,
+    cartPromo: '', promoPct: 0, cartPoints: 0, form: { name: '', city: '', pvz: null, comment: '' },
+    modal: null, lastSeenNotif: null
   };
   let map = null;
 
@@ -25,25 +25,24 @@
 
   // ---------- вход ----------
   function viewLogin() {
-    const demoCode = S.get().sms[ui.loginPhone];
+    const reg = ui.loginMode === 'register';
     root.innerHTML = `<div class="login">
       <div style="padding:26px 20px 0;color:#121212">${logoHtml()}</div>
       <div class="box">
-        <h2 style="font-size:26px">Вход для мастеров</h2>
+        <h2 style="font-size:26px">${reg ? 'Регистрация мастера' : 'Вход для мастеров'}</h2>
         <p class="muted small" style="margin:6px 0 12px">Каталог, заказ с доставкой в пункт выдачи СДЭК, баллы и скидки</p>
-        ${ui.loginStep === 1 ? `
-          <label class="f">Номер телефона</label>
-          <input class="input" id="lp" inputmode="tel" placeholder="+7 900 000-00-00" value="${esc(ui.loginPhone)}">
-          ${ui.loginErr ? `<div class="small" style="color:var(--err);margin-top:6px">${esc(ui.loginErr)}</div>` : ''}
-          <button class="btn y full gap" data-act="sendCode">Получить код</button>` : `
-          <div class="small muted">Код отправлен на ${esc(ui.loginPhone)}</div>
-          <label class="f">Код из SMS</label>
-          <input class="input" id="lc" inputmode="numeric" maxlength="4" placeholder="••••" value="${esc(ui.loginCode)}" style="font-size:22px;letter-spacing:8px;text-align:center">
-          ${ui.loginErr ? `<div class="small" style="color:var(--err);margin-top:6px">${esc(ui.loginErr)}</div>` : ''}
-          ${demoCode ? `<div class="demo">Демо-режим: SMS не отправляются. Ваш код: <b>${demoCode.code}</b></div>` : ''}
-          <button class="btn y full gap" data-act="verify">Войти</button>
-          <button class="btn ghost full gap" data-act="backLogin">Изменить номер</button>`}
+        ${reg ? `<label class="f">Имя</label><input class="input" id="ln" placeholder="Как к вам обращаться" value="${esc(ui.loginName)}">` : ''}
+        <label class="f">Номер телефона</label>
+        <input class="input" id="lp" inputmode="tel" placeholder="+7 900 000-00-00" value="${esc(ui.loginPhone)}">
+        <label class="f">Пароль${reg ? ' (не короче 6 символов)' : ''}</label>
+        <input class="input" id="lw" type="password" autocomplete="${reg ? 'new-password' : 'current-password'}">
+        ${ui.loginErr ? `<div class="small" style="color:var(--err);margin-top:6px">${esc(ui.loginErr)}</div>` : ''}
+        <button class="btn y full gap" data-act="${reg ? 'doRegister' : 'doLogin'}" ${ui.busy ? 'disabled' : ''}>${ui.busy ? 'Подождите…' : reg ? 'Зарегистрироваться' : 'Войти'}</button>
+        <button class="btn ghost full gap" data-act="toggleLogin">${reg ? 'У меня уже есть аккаунт' : 'Впервые здесь? Регистрация'}</button>
       </div></div>`;
+  }
+  function viewLoading(err) {
+    root.innerHTML = `<div class="empty" style="padding-top:30vh"><div class="big">⏳</div>${err ? esc(err) : 'Загрузка…'}</div>`;
   }
 
   // ---------- каркас ----------
@@ -141,7 +140,7 @@
 
   // ---------- корзина ----------
   function viewCart() {
-    const u = S.currentUser(), c = S.calc(u, { promo: ui.cartPromo, points: ui.cartPoints });
+    const u = S.currentUser(), c = S.calc(u, { promoPct: ui.promoPct, points: ui.cartPoints });
     ui.cartPoints = c.points;
     if (!c.lines.length) return shell('Корзина', `<div class="empty"><div class="big">🛒</div>Корзина пуста<div class="gap"><a class="btn y" href="#/catalog">В каталог</a></div></div>`, { back: true });
     const promoOk = ui.cartPromo && c.promoPct;
@@ -170,7 +169,7 @@
 
   // ---------- оформление ----------
   function viewCheckout() {
-    const u = S.currentUser(), c = S.calc(u, { promo: ui.cartPromo, points: ui.cartPoints });
+    const u = S.currentUser(), c = S.calc(u, { promoPct: ui.promoPct, points: ui.cartPoints });
     if (!c.lines.length) return go('#/cart');
     const f = ui.form; f.name = f.name || u.name; f.city = f.city || u.city || 'Москва';
     const list = window.PVZ.list.filter(p => p.city === f.city);
@@ -303,8 +302,9 @@
   // ---------- рендер ----------
   function render() {
     if (map) { map.remove(); map = null; }
+    if (!ui.ready) return viewLoading();
     const u = S.currentUser();
-    if (!u) { modalEl.innerHTML = ''; return viewLogin(); }
+    if (!u) { modalEl.innerHTML = ''; return S.loadError() ? viewLoading('Не удалось загрузить данные: ' + S.loadError()) : viewLogin(); }
     const [r, id] = route();
     ({ catalog: viewCatalog, merch: viewMerch, fav: viewFav, cart: viewCart, checkout: viewCheckout, orders: viewOrders,
        order: () => viewOrder(id), profile: viewProfile, notifs: viewNotifs, social: viewSocial }[r] || viewCatalog)();
@@ -317,17 +317,17 @@
     const a = el.dataset.act, d = el.dataset;
     if (a === 'closeModal' && el.classList.contains('ov') && e.target !== el) return;
     if (a === 'fav') { e.stopPropagation(); S.toggleFav(d.id); return; }
-    if (a === 'sendCode') {
-      const r = S.requestCode(document.getElementById('lp').value);
+    if (a === 'doLogin' || a === 'doRegister') {
+      ui.loginPhone = document.getElementById('lp').value;
+      const pw = document.getElementById('lw').value, nameEl = document.getElementById('ln');
+      if (nameEl) ui.loginName = nameEl.value;
+      ui.busy = true; ui.loginErr = ''; render();
+      const r = a === 'doLogin' ? await S.login(ui.loginPhone, pw) : await S.register(ui.loginPhone, pw, ui.loginName);
+      ui.busy = false;
       if (r.error) { ui.loginErr = r.error; return render(); }
-      ui.loginPhone = r.phone; ui.loginStep = 2; ui.loginErr = ''; return render();
+      go('#/catalog'); return render();
     }
-    if (a === 'verify') {
-      const r = S.verifyCode(ui.loginPhone, document.getElementById('lc').value);
-      if (r.error) { ui.loginErr = r.error; return render(); }
-      ui.loginStep = 1; ui.loginErr = ''; go('#/catalog'); return render();
-    }
-    if (a === 'backLogin') { ui.loginStep = 1; ui.loginErr = ''; return render(); }
+    if (a === 'toggleLogin') { ui.loginMode = ui.loginMode === 'login' ? 'register' : 'login'; ui.loginErr = ''; return render(); }
     if (a === 'back') return history.length > 1 ? history.back() : go('#/catalog');
     if (a === 'goNotifs') return go('#/notifs');
     if (a === 'goOrder') return go('#/order/' + d.id);
@@ -340,29 +340,39 @@
       const u = S.currentUser(), it = u.cart.find(c => c.pid === d.p && c.vid === d.v);
       S.setQty(d.p, d.v, (it ? it.qty : 0) + Number(d.d)); return;
     }
-    if (a === 'applyPromo') { ui.cartPromo = document.getElementById('promo').value.trim().toUpperCase(); return render(); }
-    if (a === 'maxPts') { const c = S.calc(S.currentUser(), { promo: ui.cartPromo, points: 1e9 }); ui.cartPoints = c.points; return render(); }
+    if (a === 'applyPromo') {
+      ui.cartPromo = document.getElementById('promo').value.trim().toUpperCase();
+      ui.promoPct = ui.cartPromo ? await S.checkPromo(ui.cartPromo) : 0; return render();
+    }
+    if (a === 'maxPts') { const c = S.calc(S.currentUser(), { promoPct: ui.promoPct, points: 1e9 }); ui.cartPoints = c.points; return render(); }
     if (a === 'toCheckout') return go('#/checkout');
     if (a === 'pickPvz') return pick(d.id);
     if (a === 'submitOrder') {
       const f = ui.form;
-      const r = S.createOrder({ name: f.name, pvz: f.pvz, comment: f.comment, points: ui.cartPoints, promo: ui.cartPromo });
+      if (!f.pvz) return toast('Выберите пункт выдачи СДЭК');
+      if (!f.name.trim()) return toast('Укажите имя получателя');
+      el.disabled = true;
+      const r = await S.createOrder({ name: f.name, pvz: f.pvz, comment: f.comment, points: ui.cartPoints, promo: ui.cartPromo });
+      el.disabled = false;
       if (r.error) return toast(r.error);
-      ui.cartPromo = ''; ui.cartPoints = 0; ui.form = { name: '', city: f.city, pvz: null, comment: '' };
+      ui.cartPromo = ''; ui.promoPct = 0; ui.cartPoints = 0; ui.form = { name: '', city: f.city, pvz: null, comment: '' };
       toast('Заявка отправлена администратору'); return go('#/order/' + r.order.id);
     }
     if (a === 'pay') { ui.modal = { type: 'pay', id: d.id }; return render(); }
-    if (a === 'confirmPay') { S.payOrder(d.id); ui.modal = null; toast('Оплата прошла'); return render(); }
-    if (a === 'cancel') { if (confirm('Отменить заказ? Списанные баллы вернутся.')) { const r = S.cancelOrder(d.id); if (r && r.error) toast(r.error); } return; }
+    if (a === 'confirmPay') {
+      const r = await S.payOrder(d.id); ui.modal = null;
+      toast(r.error || 'Оплата прошла'); return render();
+    }
+    if (a === 'cancel') { if (confirm('Отменить заказ? Списанные баллы вернутся.')) { const r = await S.cancelOrder(d.id); if (r.error) toast(r.error); } return; }
     if (a === 'repeat') { const n = S.repeatOrder(d.id); toast(n ? 'Товары добавлены в корзину' : 'Товаров нет в наличии'); if (n) go('#/cart'); return; }
-    if (a === 'saveProfile') { S.updateProfile({ name: document.getElementById('pname').value.trim() }); toast('Сохранено'); return; }
-    if (a === 'logout') { S.logout(); ui.loginPhone = ''; return render(); }
+    if (a === 'saveProfile') { await S.updateProfile({ name: document.getElementById('pname').value.trim() }); toast('Сохранено'); return; }
+    if (a === 'logout') { await S.logout(); ui.loginPhone = ''; return render(); }
     if (a === 'sendSocial') {
       const url = document.getElementById('surl').value.trim(), f = document.getElementById('sshot').files[0];
       if (!url && !f) return toast('Добавьте ссылку или скриншот');
       let shot = ''; if (f) { try { shot = await window.U.shrink(f, 700, .6); } catch (er) { /* без скриншота */ } }
-      S.submitSocial(document.getElementById('snet').value, url, document.getElementById('snote').value.trim(), shot);
-      toast('Отправлено на проверку'); return;
+      const r = await S.submitSocial(document.getElementById('snet').value, url, document.getElementById('snote').value.trim(), shot);
+      toast(r.error || 'Отправлено на проверку'); return;
     }
   });
   document.addEventListener('input', e => {
@@ -393,6 +403,10 @@
     window.scrollTo(0, y);
   });
 
-  { const ph = S.currentPhone(); const n = ph && S.get().notifications.find(x => x.phone === ph); ui.lastSeenNotif = n ? n.id : null; }
   render();
+  S.ready.then(() => {
+    ui.ready = true;
+    const n = S.get().notifications[0]; ui.lastSeenNotif = n ? n.id : null;
+    render();
+  });
 })();

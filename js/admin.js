@@ -2,7 +2,15 @@
   'use strict';
   const S = window.Store, { esc, date } = window.U, rub = S.rub;
   const root = document.getElementById('adm'), modalEl = document.getElementById('modal');
-  const st = { tab: 'orders', statusFilter: 'all', q: '', modal: null, auth: sessionStorage.getItem('3dk_adm') === '1', err: '' };
+  const st = { tab: 'orders', statusFilter: 'all', q: '', modal: null, err: '', busy: false, ready: false, email: '' };
+  const isAdmin = () => { const u = S.currentUser(); return !!(u && u.isAdmin); };
+  // выполняет действие на сервере и показывает результат
+  async function run(promise, okMsg) {
+    const r = await promise;
+    if (r && r.error) { toast(r.error); return r; }
+    if (okMsg) toast(okMsg);
+    return r || {};
+  }
   const tagCls = o => ({ pending: 'y', approved: 'blue', paid: 'blue', shipped: 'blue', delivered: 'ok', rejected: 'err', cancelled: '' }[o.status]);
   const toast = m => { const t = document.createElement('div'); t.className = 'toast'; t.textContent = m; document.body.appendChild(t); setTimeout(() => t.remove(), 3000); };
   const D = () => S.get();
@@ -11,10 +19,11 @@
   function viewAuth() {
     root.innerHTML = `<div style="max-width:380px;margin:12vh auto"><div class="card">
       <img class="logo-img" src="assets/logo.webp" alt="3D KRESTIKI" style="margin-bottom:10px"><h2>Админ-панель</h2>
-      <label class="f">Пароль</label><input class="input" type="password" id="pw" autofocus>
-      ${st.err ? `<div class="small" style="color:var(--err);margin-top:6px">${st.err}</div>` : ''}
-      <button class="btn y full gap" data-act="login">Войти</button>
-      <div class="small muted gap">Демо-пароль: <b>${esc(D().settings.adminPass)}</b> (меняется в настройках)</div></div></div>`;
+      <label class="f">Email администратора</label><input class="input" id="em" type="email" autocomplete="username" value="${esc(st.email)}">
+      <label class="f">Пароль</label><input class="input" type="password" id="pw" autocomplete="current-password">
+      ${st.err ? `<div class="small" style="color:var(--err);margin-top:6px">${esc(st.err)}</div>` : ''}
+      <button class="btn y full gap" data-act="login" ${st.busy ? 'disabled' : ''}>${st.busy ? 'Подождите…' : 'Войти'}</button>
+      <div class="small muted gap">Аккаунт создаётся в Supabase (Authentication → Users), права выдаёт SQL из инструкции.</div></div></div>`;
   }
 
   // ---------- шапка ----------
@@ -101,7 +110,8 @@
   function viewCatalog() {
     const q = st.q.trim().toLowerCase();
     const l = D().products.filter(p => !q || (p.name + p.sku + p.brand + p.category).toLowerCase().includes(q));
-    return `<div class="dz"><b>Загрузка прайса</b>
+    return `${D().products.length ? '' : `<div class="dz"><b>Каталог пуст.</b> Загрузите стартовый набор из прайс-скриншотов (${window.CATALOG.length} товаров) или свой CSV ниже. <div class="gap"><button class="btn y sm" data-act="seedCatalog">Загрузить стартовый каталог</button></div></div>`}
+    <div class="dz"><b>Загрузка прайса</b>
       <div class="small muted">CSV с разделителем «;» или «,». Колонки: <b>sku; name; brand; category; variant; price; stock</b>. Одна строка = один вариант товара; строки с одним sku объединяются. stock: 1 — в наличии, 0 — нет. Для мерча в category напишите «Мерч».</div>
       <div class="row gap" style="flex-wrap:wrap"><input type="file" id="csv" accept=".csv,.txt">
         <select class="input" id="csvmode" style="max-width:240px"><option value="merge">Обновить и добавить</option><option value="replace">Заменить весь каталог</option></select>
@@ -150,7 +160,6 @@
         <label class="f">Максимум % заказа, оплачиваемый баллами</label><input class="input" type="number" id="s_max" value="${s.maxPointsPercent}">
         <label class="f">Баллов за публикацию в соцсети (по умолчанию)</label><input class="input" type="number" id="s_soc" value="${s.socialReward}">
         <label class="f">Приветственный бонус новому клиенту</label><input class="input" type="number" id="s_wel" value="${s.welcomeBonus}">
-        <label class="f">Пароль администратора</label><input class="input" id="s_pass" value="${esc(s.adminPass)}">
         <button class="btn y gap" data-act="saveSettings">Сохранить</button></div>
       <div class="card"><h3>Уровни лояльности</h3><div class="small muted">Скидка зависит от суммы выкупленных заказов</div>
         ${s.loyalty.map((l, i) => `<div class="row gap" style="margin-top:8px"><input class="input" data-lv="${i}" data-k="name" value="${esc(l.name)}"><input class="input num" type="number" data-lv="${i}" data-k="from" value="${l.from}" title="от суммы"><input class="input num" type="number" data-lv="${i}" data-k="discount" value="${l.discount}" title="скидка %"><span class="small">%</span></div>`).join('')}
@@ -158,7 +167,7 @@
         <h3 class="gap" style="margin-top:18px">Промокоды</h3>
         ${D().promos.map((p, i) => `<div class="row between gap small"><span><b>${esc(p.code)}</b> · ${p.percent}%</span><button class="btn sm ${p.active ? 'ok' : 'ghost'}" data-act="togglePromo" data-i="${i}">${p.active ? 'активен' : 'выключен'}</button></div>`).join('')}
         <div class="row gap"><input class="input" id="pc" placeholder="КОД"><input class="input num" id="pp" type="number" placeholder="%"><button class="btn sm" data-act="addPromo">Добавить</button></div></div></div>
-      <div class="card"><b>Демо-данные</b><div class="small muted">Сбросить всё: заказы, клиентов, баллы и каталог вернутся к начальному состоянию.</div><button class="btn err sm gap" data-act="reset">Сбросить демо-данные</button></div>`;
+`;
   }
   function viewJournal() {
     const l = D().journal;
@@ -167,7 +176,8 @@
 
   // ---------- рендер ----------
   function render() {
-    if (!st.auth) { modalEl.innerHTML = ''; return viewAuth(); }
+    if (!st.ready) { root.innerHTML = '<div class="empty" style="padding-top:30vh"><div class="big">⏳</div>Загрузка…</div>'; return; }
+    if (!isAdmin()) { modalEl.innerHTML = ''; return viewAuth(); }
     const body = { orders: viewOrders, catalog: viewCatalog, clients: viewClients, social: viewSocial, settings: viewSettings, journal: viewJournal }[st.tab]();
     const fy = window.scrollY, active = document.activeElement && document.activeElement.id;
     root.innerHTML = tabs() + body;
@@ -187,34 +197,47 @@
     const a = el.dataset.act, d = el.dataset;
     if (a === 'closeModal' && el.classList.contains('amodal') && e.target !== el) return;
     switch (a) {
-      case 'login': if (document.getElementById('pw').value === D().settings.adminPass) { st.auth = true; st.err = ''; sessionStorage.setItem('3dk_adm', '1'); } else st.err = 'Неверный пароль'; return render();
-      case 'exit': st.auth = false; sessionStorage.removeItem('3dk_adm'); return render();
+      case 'login': {
+        st.email = document.getElementById('em').value;
+        const pass = document.getElementById('pw').value; // читаем до перерисовки формы
+        st.busy = true; st.err = ''; render();
+        const r = await S.adminLogin(st.email, pass);
+        st.busy = false; st.err = r.error || ''; return render();
+      }
+      case 'exit': await S.logout(); return render();
       case 'tab': st.tab = d.t; return render();
       case 'sf': st.statusFilter = d.v; return render();
       case 'openOrder': return showModal('order', d.id);
       case 'closeModal': return closeModal();
-      case 'approve': S.approveOrder(d.id, false); return toast('Заказ одобрен, клиент уведомлён');
-      case 'approveNoPay': S.approveOrder(d.id, true); return toast('Одобрен без оплаты, клиент уведомлён');
+      case 'approve': return void run(S.approveOrder(d.id, false), 'Заказ одобрен, клиент уведомлён');
+      case 'approveNoPay': return void run(S.approveOrder(d.id, true), 'Одобрен без оплаты, клиент уведомлён');
       case 'reject': return showModal('reject', d.id);
-      case 'doReject': { const r = document.getElementById('rrs').value.trim(); if (!r) return toast('Укажите причину'); S.rejectOrder(d.id, r); showModal('order', d.id); return toast('Заказ отклонён'); }
+      case 'doReject': {
+        const reason = document.getElementById('rrs').value.trim(); if (!reason) return toast('Укажите причину');
+        const r = await run(S.rejectOrder(d.id, reason), 'Заказ отклонён'); if (!r.error) showModal('order', d.id); return;
+      }
       case 'editOrder': return showModal('edit', d.id);
       case 'saveApprove': case 'saveOnly': {
         const items = [...document.querySelectorAll('#etbl tr[data-pid]')].map(tr => ({
           pid: tr.dataset.pid, vid: tr.dataset.vid,
           price: Number(tr.querySelector('[data-f=price]').value), qty: Number(tr.querySelector('[data-f=qty]').value) }));
-        const r = S.editOrder(d.id, { items, pointsUsed: Number(document.getElementById('epts').value) || 0,
-          noPay: document.getElementById('enopay').checked, adminComment: document.getElementById('ecom').value.trim() }, a === 'saveApprove');
-        if (r.error) return toast(r.error);
-        showModal('order', d.id); return toast(a === 'saveApprove' ? 'Одобрен с изменениями, клиент уведомлён' : 'Изменения сохранены, клиент уведомлён');
+        const r = await run(S.editOrder(d.id, { items, pointsUsed: Number(document.getElementById('epts').value) || 0,
+          noPay: document.getElementById('enopay').checked, adminComment: document.getElementById('ecom').value.trim() }, a === 'saveApprove'),
+          a === 'saveApprove' ? 'Одобрен с изменениями, клиент уведомлён' : 'Изменения сохранены, клиент уведомлён');
+        if (!r.error) showModal('order', d.id); return;
       }
-      case 'markPaid': S.markPaidManually(d.id); return;
-      case 'ship': S.advanceOrder(d.id, 'shipped'); return;
-      case 'deliver': S.advanceOrder(d.id, 'delivered'); return;
+      case 'markPaid': return void run(S.markPaidManually(d.id), 'Оплата отмечена');
+      case 'ship': return void run(S.advanceOrder(d.id, 'shipped'), 'Передан в СДЭК, клиент уведомлён');
+      case 'deliver': return void run(S.advanceOrder(d.id, 'delivered'), 'Выдан, баллы начислены');
+      case 'seedCatalog': {
+        if (!confirm('Загрузить в базу стартовый каталог (' + window.CATALOG.length + ' товаров)?')) return;
+        return void run(S.importProducts(window.CATALOG.map(p => Object.assign({}, p)), 'merge'), 'Каталог загружен');
+      }
       case 'importCsv': {
         const f = document.getElementById('csv').files[0]; if (!f) return toast('Выберите файл');
         const r = S.parseCsv(await f.text()); if (r.error) return toast(r.error);
         if (!r.products.length) return toast('В файле нет товаров');
-        S.importProducts(r.products, document.getElementById('csvmode').value); return toast('Загружено товаров: ' + r.products.length);
+        return void run(S.importProducts(r.products, document.getElementById('csvmode').value), 'Загружено товаров: ' + r.products.length);
       }
       case 'exportCsv': {
         const rows = ['sku;name;brand;category;variant;price;stock'];
@@ -228,44 +251,42 @@
           const sku = f.name.replace(/\.[^.]+$/, '').toUpperCase();
           const p = D().products.find(x => x.sku.toUpperCase() === sku);
           if (!p) { miss.push(f.name); continue; }
-          try { if (S.setPhoto(p.sku, await window.U.shrink(f, 420, .7))) ok++; else { toast('Память браузера заполнена'); break; } } catch (er) { miss.push(f.name); }
+          try { if (await S.setPhoto(p.sku, await window.U.shrink(f, 420, .7))) ok++; else miss.push(f.name); } catch (er) { miss.push(f.name); }
         }
-        render(); return toast('Фото загружено: ' + ok + (miss.length ? '. Не найден артикул: ' + miss.slice(0, 5).join(', ') : ''));
+        return toast('Фото загружено: ' + ok + (miss.length ? '. Не загружено: ' + miss.slice(0, 5).join(', ') : ''));
       }
       case 'newProduct': {
         const sku = prompt('Артикул (латиницей, например NEW-1):'); if (!sku) return;
         const name = prompt('Название товара:'); if (!name) return;
         const price = Number(prompt('Цена, ₽:')); if (!price) return;
-        S.upsertProduct({ id: sku.toLowerCase().replace(/[^a-z0-9]+/g, '-'), sku, name, brand: '3D KRESTIKI', category: 'Прочее', desc: '', variants: [{ id: 'v1', label: 'шт', price, inStock: true }], inStock: true }); return;
+        return void run(S.saveProduct({ id: sku.toLowerCase().replace(/[^a-z0-9]+/g, '-'), sku, name, brand: '3D KRESTIKI', category: 'Прочее', desc: '', variants: [{ id: 'v1', label: 'шт', price, inStock: true }], inStock: true }), 'Товар добавлен');
       }
       case 'delProduct': if (confirm('Удалить товар из каталога?')) S.deleteProduct(d.p); return;
       case 'adjPts': {
         const n = Number(prompt('Сколько баллов начислить (отрицательное число — списать)?')); if (!n) return;
-        S.adjustPoints(d.ph, n, prompt('Причина (увидит клиент):') || ''); return;
+        return void run(S.adjustPoints(d.ph, n, prompt('Причина (увидит клиент):') || ''), 'Баллы изменены');
       }
-      case 'socOk': S.reviewSocial(d.id, true, Number(document.getElementById('rw-' + d.id).value) || 0); return;
-      case 'socNo': S.reviewSocial(d.id, false); return;
+      case 'socOk': return void run(S.reviewSocial(d.id, true, Number(document.getElementById('rw-' + d.id).value) || 0), 'Публикация одобрена, баллы начислены');
+      case 'socNo': return void run(S.reviewSocial(d.id, false), 'Публикация отклонена');
       case 'saveSettings': {
         const g = id => Number(document.getElementById(id).value) || 0, loyalty = D().settings.loyalty.map(l => Object.assign({}, l));
         document.querySelectorAll('[data-lv]').forEach(i => { loyalty[+i.dataset.lv][i.dataset.k] = i.dataset.k === 'name' ? i.value : Number(i.value) || 0; });
-        S.updateSettings({ earnPercent: g('s_earn'), maxPointsPercent: Math.min(100, g('s_max')), socialReward: g('s_soc'), welcomeBonus: g('s_wel'), adminPass: document.getElementById('s_pass').value || '3dk-admin', loyalty });
-        return toast('Настройки сохранены');
+        return void run(S.updateSettings({ earnPercent: g('s_earn'), maxPointsPercent: Math.min(100, g('s_max')), socialReward: g('s_soc'), welcomeBonus: g('s_wel'), loyalty }), 'Настройки сохранены');
       }
-      case 'togglePromo': D().promos[+d.i].active = !D().promos[+d.i].active; S.save(); return;
+      case 'togglePromo': { const p = D().promos[+d.i]; return void run(S.savePromo(p.code, p.percent, !p.active)); }
       case 'addPromo': {
         const c = document.getElementById('pc').value.trim().toUpperCase(), p = Number(document.getElementById('pp').value);
         if (!c || !(p > 0 && p <= 100)) return toast('Введите код и скидку 1–100%');
-        D().promos.push({ code: c, percent: p, active: true }); S.save(); return;
+        return void run(S.savePromo(c, p, true), 'Промокод добавлен');
       }
-      case 'reset': if (confirm('Удалить все заказы, клиентов и вернуть исходный каталог?')) { S.resetAll(); toast('Демо-данные сброшены'); } return;
     }
   });
   document.addEventListener('change', e => {
     const el = e.target, a = el.dataset && el.dataset.act; if (!a) return;
     const d = el.dataset;
-    if (a === 'price') { const v = S.variantOf(S.product(d.p), d.v); if (v) { v.price = Math.max(0, Number(el.value) || 0); S.save(); } }
-    if (a === 'vstock') S.setStock(d.p, d.v, el.checked);
-    if (a === 'pstock') S.setStock(d.p, null, el.checked);
+    if (a === 'price') run(S.setPrice(d.p, d.v, el.value), 'Цена сохранена');
+    if (a === 'vstock') run(S.setStock(d.p, d.v, el.checked));
+    if (a === 'pstock') run(S.setStock(d.p, null, el.checked));
   });
   document.addEventListener('input', e => {
     if (e.target.id === 'aq') { st.q = e.target.value; const q = st.q.trim().toLowerCase(); document.getElementById('ptable').innerHTML = prodTable(D().products.filter(p => !q || (p.name + p.sku + p.brand + p.category).toLowerCase().includes(q))); }
@@ -274,4 +295,5 @@
 
   S.subscribe(render);
   render();
+  S.ready.then(() => { st.ready = true; render(); });
 })();
