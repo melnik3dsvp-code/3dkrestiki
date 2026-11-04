@@ -6,6 +6,11 @@
 <meta name="theme-color" content="#FFB800">
 <title>3DKRESTIKI</title>
 <link rel="manifest" href="manifest.json">
+<link rel="icon" type="image/png" href="assets/icon-192.png">
+<link rel="apple-touch-icon" href="assets/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="3DKRESTIKI">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <link rel="stylesheet" href="css/style.css">
 </head>
@@ -19,5 +24,6 @@
 <script src="js/util.js"></script>
 <script src="js/store.js"></script>
 <script src="js/app.js"></script>
+<script>if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(function () {});</script>
 </body>
 </html>
